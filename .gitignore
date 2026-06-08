@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Checkpoints & model weights
+checkpoints/
+checkpoints_demo/
+*.pt
+*.pth
+*.h5
+*.pkl
+*.ckpt
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Logs & outputs
+*.log
+logs/
+runs/
+tensorboard/
+wandb/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Generated images/videos (keep source assets)
+*.mp4
+*.gif
+*.avi
