@@ -51,3 +51,6 @@ wandb/
 *.mp4
 *.gif
 *.avi
+
+# Claude Code
+CLAUDE.md

@@ -24,7 +24,7 @@ Coordinate convention
 ---------------------------------------------
   Each doorway is 3 cells wide (centre ± 1).
 
-  Row 19 ██████████████████████████████████████████
+  Row 19 ███████████████████████████████████████████████████████████
   Row 18 ██  .  .  .  .  .  .  .  .  ██  .  .  .  .  .  .  .  .  ██
    ...                  Room 2 (TL)   ██       Room 4 (TR)
   Row 17 ██  .  .  .  .  .  .  .  .  ██  .  .  .  .  .  .  .  .  ██
@@ -76,27 +76,48 @@ class FourRoomMazeEnv(gym.Env):
     max_steps   : int   Episode horizon (truncation condition).
     d_min       : float Minimum Euclidean distance between sampled start & goal.
     goal_radius : float ε — goal is reached when ||pos − goal|| < goal_radius.
-    alpha       : float Scale for potential-based reward shaping term r2.
+    patch_size  : int   Side length of the local occupancy patch (must be odd).
+                        Default 11 ensures a doorway is visible from any point
+                        inside a room (rooms are 9 cells wide; half-patch = 5).
     render_mode : str   'human' or 'rgb_array' (None disables rendering).
+
+    Observation  (shape: 4 + patch_size² = 125 for patch_size=11)
+    ---------------------------------------------------------------
+    [0]   x  / G          agent x, normalised
+    [1]   y  / G          agent y, normalised
+    [2]   gx / G          goal  x, normalised
+    [3]   gy / G          goal  y, normalised
+    [4:]  patch.flatten() patch_size×patch_size occupancy window centred on
+                          agent's cell; 0=free, 1=wall; out-of-bounds → 1.
+
+    Reward
+    ------
+    +1.0  goal reached  (||pos − goal|| < goal_radius)
+    −0.5  invalid move  (wall hit or out-of-bounds)
+     0.0  otherwise
+    No distance-based shaping: the local patch makes wall geometry directly
+    observable, so the agent does not need an extrinsic navigation signal.
     """
 
     metadata = {"render_modes": ["human", "rgb_array"]}
 
     def __init__(
         self,
-        max_steps: int   = 500,
-        d_min: float     = 5.0,
+        max_steps:   int   = 500,
+        d_min:       float = 5.0,
         goal_radius: float = 0.5,
-        alpha: float     = 0.02,
-        render_mode: str = None,
+        patch_size:  int   = 11,
+        render_mode: str   = None,
     ):
         super().__init__()
+
+        assert patch_size % 2 == 1, "patch_size must be odd"
 
         self.grid_size   = 20
         self.max_steps   = max_steps
         self.d_min       = d_min
         self.goal_radius = goal_radius
-        self.alpha       = alpha
+        self.patch_size  = patch_size
         self.render_mode = render_mode
 
         # ── Occupancy grid ────────────────────────────────────────────
@@ -113,10 +134,22 @@ class FourRoomMazeEnv(gym.Env):
             dtype=np.float32,
         )  # shape (N_free, 2)
 
+        # Padded grid for patch extraction (border = 1 / wall).
+        # Computed once and reused every call to _get_local_patch.
+        _half = patch_size // 2
+        self._padded = np.ones(
+            (self.grid_size + 2 * _half, self.grid_size + 2 * _half),
+            dtype=np.float32,
+        )
+        self._padded[_half : _half + self.grid_size,
+                     _half : _half + self.grid_size] = self.grid
+        self._patch_half = _half
+
         # ── Gymnasium spaces ──────────────────────────────────────────
-        # Observation: (x/G, y/G, gx/G, gy/G) normalised to [0, 1]^4
+        # Observation: 4 scalars + patch_size² binary values ∈ [0, 1]
+        obs_dim = 4 + patch_size ** 2          # 125 for patch_size=11
         self.observation_space = spaces.Box(
-            low=0.0, high=1.0, shape=(4,), dtype=np.float32
+            low=0.0, high=1.0, shape=(obs_dim,), dtype=np.float32
         )
         # Action: continuous displacement Δ(x, y) in [-1, +1]^2
         self.action_space = spaces.Box(
@@ -126,6 +159,7 @@ class FourRoomMazeEnv(gym.Env):
         # ── Episode state (populated in reset()) ─────────────────────
         self.pos:        np.ndarray = None   # agent position  (x, y)
         self.goal:       np.ndarray = None   # goal  position  (x, y)
+        self.start_pos:  np.ndarray = None   # start position  (x, y)
         self.step_count: int        = 0
 
         # ── Rendering ─────────────────────────────────────────────────
@@ -167,7 +201,6 @@ class FourRoomMazeEnv(gym.Env):
         #     cols 4-6  → Room1 ↔ Room2
         #     cols 14-16 → Room3 ↔ Room4
         grid[G//2,    :]    = 1
-        #widened the doorways from 1 cell to 3 cells, so the single-cell openings below are replaced by loops that set the 3 doorway cells to free (0)
         #grid[G//2,  G//4]   = 0   # (old single-cell doorway — replaced below)
         #grid[G//2, 3*G//4]  = 0   # (old single-cell doorway — replaced below)
         for delta in [-1, 0, 1]:
@@ -199,6 +232,25 @@ class FourRoomMazeEnv(gym.Env):
             return False
         row, col = self._cell(pos)
         return self.grid[row][col] == 0
+
+    def _get_local_patch(self) -> np.ndarray:
+        """
+        Extract a patch_size × patch_size occupancy window centred on the
+        agent's current cell, flattened to shape (patch_size²,).
+
+        Uses the precomputed padded grid (self._padded) so out-of-bounds
+        cells are read as 1 (wall) without branching.
+
+        Layout: patch[i][j] = cell at (row + i − half, col + j − half)
+          → patch[half][half] is always the agent's own cell (value 0,
+            since the agent can only occupy free cells).
+        """
+        row, col = self._cell(self.pos)
+        h  = self._patch_half          # 5 for 11×11
+        pr = row + h                   # agent row in padded grid
+        pc = col + h                   # agent col in padded grid
+        return self._padded[pr - h : pr + h + 1,
+                            pc - h : pc + h + 1].flatten()
 
     def _ray_march(
         self,
@@ -257,33 +309,45 @@ class FourRoomMazeEnv(gym.Env):
     # ─────────────────────────────────────────────────────────────────
 
     def _get_obs(self) -> np.ndarray:
-        """Normalise (x, y, gx, gy) to [0, 1]^4."""
+        """
+        Return normalised observation of shape (4 + patch_size²,).
+
+        First 4 values: (x/G, y/G, gx/G, gy/G) ∈ [0, 1]
+        Remaining 121:  flattened 11×11 local occupancy patch ∈ {0, 1}
+        """
         G = float(self.grid_size)
-        return np.array(
+        scalars = np.array(
             [self.pos[0] / G, self.pos[1] / G,
              self.goal[0] / G, self.goal[1] / G],
             dtype=np.float32,
         )
+        return np.concatenate([scalars, self._get_local_patch()])
 
     def _compute_reward(
         self,
-        old_pos:    np.ndarray,
         new_pos:    np.ndarray,
         valid_move: bool,
     ):
         """
-        Reward = r1 + r2
+        Sparse reward — no distance shaping.
 
-        r1 — sparse terminal signal
-          +1.0  agent reached goal (||new_pos − goal|| < goal_radius)
-          −1.0  invalid action (wall hit or out-of-bounds)
-           0.0  otherwise
+        +1.0  goal reached  (||new_pos − goal|| < goal_radius)
+        −0.5  invalid move  (wall hit or out-of-bounds)
+         0.0  otherwise
 
-        r2 — potential-based shaping  (Ng et al., 1999)
-          α · (||old_pos − goal|| − ||new_pos − goal||)
-          Positive when agent moves closer; zero for invalid moves
-          (new_pos == old_pos, so distances cancel).
-          Guaranteed not to alter the optimal policy.
+        Rationale for removing Euclidean shaping (r2):
+          r2 = α·(d_old − d_new) rewards straight-line progress, which
+          points through walls near doorways — the opposite of what the agent
+          needs.  The 11×11 local patch makes wall geometry directly
+          observable, so the network can learn wall-aware navigation without
+          an extrinsic navigation signal.
+
+        Rationale for −0.5 (not −1.0) wall penalty:
+          With only +1 at the goal and nothing elsewhere, a −1.0 wall penalty
+          creates a heavily asymmetric signal (the agent sees thousands of −1
+          events before a single +1), pushing it toward cautious idling rather
+          than goal-directed exploration.  −0.5 preserves the deterrent while
+          keeping the signal closer to balanced.
 
         Returns
         -------
@@ -294,17 +358,13 @@ class FourRoomMazeEnv(gym.Env):
         )
 
         if not valid_move:
-            r1 = -1.0
+            reward = -0.5
         elif goal_reached:
-            r1 = +1.0
+            reward = +1.0
         else:
-            r1 = 0.0
+            reward = 0.0
 
-        #old_dist = np.linalg.norm(old_pos - self.goal)
-        #new_dist = np.linalg.norm(new_pos - self.goal)
-        #r2 = self.alpha * (old_dist - new_dist)
-
-        return float(r1), goal_reached
+        return float(reward), goal_reached
 
     # ─────────────────────────────────────────────────────────────────
     #  Gymnasium API
@@ -313,6 +373,7 @@ class FourRoomMazeEnv(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.pos, self.goal = self._sample_valid_pair()
+        self.start_pos = self.pos.copy()
         self.step_count = 0
         return self._get_obs(), {}
 
@@ -325,7 +386,7 @@ class FourRoomMazeEnv(gym.Env):
         # Position only updates on valid moves
         self.pos = new_pos
 
-        reward, goal_reached = self._compute_reward(old_pos, new_pos, valid_move)
+        reward, goal_reached = self._compute_reward(new_pos, valid_move)
 
         self.step_count += 1
         terminated = goal_reached
@@ -373,9 +434,14 @@ class FourRoomMazeEnv(gym.Env):
         ax.plot(*self.goal, "+", color="darkgreen",
                 markersize=8, markeredgewidth=2, zorder=4)
 
+        # Start position (blue star) — shown throughout the episode
+        if self.start_pos is not None:
+            ax.plot(*self.start_pos, "*", color="royalblue",
+                    markersize=14, zorder=4)
+
         # Agent position (red dot)
         ax.plot(*self.pos, "o", color="crimson",
-                markersize=10, zorder=5, label="Agent")
+                markersize=10, zorder=5)
 
         # Decorations
         ax.set_xlim(0, G)
@@ -386,13 +452,15 @@ class FourRoomMazeEnv(gym.Env):
         ax.grid(True, color="gray", linewidth=0.3, alpha=0.4)
         ax.set_title(
             f"Step {self.step_count:4d}  |  "
-            f"pos ({self.pos[0]:.1f}, {self.pos[1]:.1f})  |  "
-            f"goal ({self.goal[0]:.1f}, {self.goal[1]:.1f})  |  "
+            f"start ({self.start_pos[0]:.1f},{self.start_pos[1]:.1f})  |  "
+            f"pos ({self.pos[0]:.1f},{self.pos[1]:.1f})  |  "
+            f"goal ({self.goal[0]:.1f},{self.goal[1]:.1f})  |  "
             f"dist {np.linalg.norm(self.pos - self.goal):.2f}",
-            fontsize=9,
+            fontsize=8,
         )
         legend_handles = [
-            mpatches.Patch(color="limegreen", label="Goal zone"),
+            mpatches.Patch(color="limegreen", label="Goal"),
+            mpatches.Patch(color="royalblue", label="Start"),
             mpatches.Patch(color="crimson",   label="Agent"),
         ]
         ax.legend(handles=legend_handles, loc="upper right", fontsize=8)
@@ -405,6 +473,12 @@ class FourRoomMazeEnv(gym.Env):
                 self._fig.canvas.tostring_rgb(), dtype=np.uint8
             )
             w, h = self._fig.canvas.get_width_height()
+            # On HiDPI/Retina displays the physical pixel count is larger
+            # than the logical size returned by get_width_height().
+            n_pix = len(buf) // 3
+            if n_pix != w * h:
+                scale = int(round((n_pix / (w * h)) ** 0.5))
+                w, h = w * scale, h * scale
             return buf.reshape(h, w, 3)
 
     def close(self):
@@ -481,18 +555,19 @@ def save_maze_figure(env: FourRoomMazeEnv, path: str = "maze_layout.png") -> Non
 
 def run_sanity_checks() -> None:
     print("=" * 65)
-    print("  4-Room Maze — Sanity Checks  (3-cell doorways)")
+    print("  4-Room Maze — Sanity Checks  (3-cell doorways, patch obs)")
     print("=" * 65)
 
-    env = FourRoomMazeEnv(d_min=5.0, render_mode=None)
+    env  = FourRoomMazeEnv(d_min=5.0, render_mode=None)
+    G    = env.grid_size
+    PS   = env.patch_size          # 11
+    HALF = env.patch_size // 2     # 5
+    OBS_DIM = 4 + PS ** 2          # 125
 
     # ── [1] Grid statistics ───────────────────────────────────────────
-    # Old layout (1-cell doorways): 293 free cells, 107 wall cells
-    # New layout (3-cell doorways): 301 free cells,  99 wall cells
-    # Gain: 4 doorways × 2 extra cells each = 8 additional free cells
     print("\n[1] Grid statistics")
     print_grid(env.grid)
-    n_total = env.grid_size ** 2
+    n_total = G ** 2
     n_wall  = int(env.grid.sum())
     n_free  = n_total - n_wall
     print(f"\n  Total cells : {n_total}")
@@ -504,148 +579,147 @@ def run_sanity_checks() -> None:
     assert n_free == len(env.free_cells), "Free-cell count mismatch!"
     print("  Grid statistics ✓")
 
-    # ── [2] Doorway verification — all 3 cells of every doorway ───────
-    # Each of the 4 doorways is 3 cells wide (centre ± 1).
-    # All 12 doorway cells must be free (grid == 0).
+    # ── [2] All 12 doorway cells free ────────────────────────────────
     print("\n[2] All 12 doorway cells (should be 0 = free)")
     doorway_cells = [
-        # Vertical divider (col=10): lower doorway, rows 4-6
-        ("col=10 row=4  (Room1↔Room3, lower edge )", ( 4, 10)),
-        ("col=10 row=5  (Room1↔Room3, centre)     ", ( 5, 10)),
-        ("col=10 row=6  (Room1↔Room3, upper edge )", ( 6, 10)),
-        # Vertical divider (col=10): upper doorway, rows 14-16
-        ("col=10 row=14 (Room2↔Room4, lower edge )", (14, 10)),
-        ("col=10 row=15 (Room2↔Room4, centre)     ", (15, 10)),
-        ("col=10 row=16 (Room2↔Room4, upper edge )", (16, 10)),
-        # Horizontal divider (row=10): left doorway, cols 4-6
-        ("row=10 col=4  (Room1↔Room2, left edge ) ", (10,  4)),
-        ("row=10 col=5  (Room1↔Room2, centre)     ", (10,  5)),
-        ("row=10 col=6  (Room1↔Room2, right edge) ", (10,  6)),
-        # Horizontal divider (row=10): right doorway, cols 14-16
-        ("row=10 col=14 (Room3↔Room4, left edge ) ", (10, 14)),
-        ("row=10 col=15 (Room3↔Room4, centre)     ", (10, 15)),
-        ("row=10 col=16 (Room3↔Room4, right edge) ", (10, 16)),
+        ("col=10 row=4  (Room1↔Room3 lower edge)", ( 4, 10)),
+        ("col=10 row=5  (Room1↔Room3 centre)    ", ( 5, 10)),
+        ("col=10 row=6  (Room1↔Room3 upper edge)", ( 6, 10)),
+        ("col=10 row=14 (Room2↔Room4 lower edge)", (14, 10)),
+        ("col=10 row=15 (Room2↔Room4 centre)    ", (15, 10)),
+        ("col=10 row=16 (Room2↔Room4 upper edge)", (16, 10)),
+        ("row=10 col=4  (Room1↔Room2 left edge) ", (10,  4)),
+        ("row=10 col=5  (Room1↔Room2 centre)    ", (10,  5)),
+        ("row=10 col=6  (Room1↔Room2 right edge)", (10,  6)),
+        ("row=10 col=14 (Room3↔Room4 left edge) ", (10, 14)),
+        ("row=10 col=15 (Room3↔Room4 centre)    ", (10, 15)),
+        ("row=10 col=16 (Room3↔Room4 right edge)", (10, 16)),
     ]
     for label, (r, c) in doorway_cells:
-        val    = env.grid[r][c]
+        val = env.grid[r][c]
         status = "✓ free" if val == 0 else "✗ BLOCKED"
         print(f"  grid[{r:2d}][{c:2d}] = {val}  {status}  ({label})")
         assert val == 0, f"Doorway cell grid[{r}][{c}] is blocked!"
     print("  All 12 doorway cells are free ✓")
 
-    # ── [3] Divider wall integrity — cells adjacent to doorway edges ──
-    # Cells immediately outside the 3-cell doorway range must be walls.
-    # This verifies the doorways are exactly 3 cells wide, no more.
+    # ── [3] Sentinel wall checks ──────────────────────────────────────
     print("\n[3] Cells adjacent to doorway edges (should be 1 = wall)")
     wall_checks = [
-        # Vertical divider (col=10): sentinels just outside rows 4-6 and 14-16
-        ("col=10 row= 3 (wall, just below lower doorway)", ( 3, 10), 1),
-        ("col=10 row= 7 (wall, just above lower doorway)", ( 7, 10), 1),
-        ("col=10 row=13 (wall, just below upper doorway)", (13, 10), 1),
-        ("col=10 row=17 (wall, just above upper doorway)", (17, 10), 1),
-        # Horizontal divider (row=10): sentinels just outside cols 4-6 and 14-16
-        ("row=10 col= 3 (wall, just left  of left doorway )", (10,  3), 1),
-        ("row=10 col= 7 (wall, just right of left doorway )", (10,  7), 1),
-        ("row=10 col=13 (wall, just left  of right doorway)", (10, 13), 1),
-        ("row=10 col=17 (wall, just right of right doorway)", (10, 17), 1),
-        # Divider intersection must remain a wall
-        ("col=10 row=10 (intersection of both dividers)    ", (10, 10), 1),
+        ("col=10 row= 3 (just below lower vert. doorway)", ( 3, 10), 1),
+        ("col=10 row= 7 (just above lower vert. doorway)", ( 7, 10), 1),
+        ("col=10 row=13 (just below upper vert. doorway)", (13, 10), 1),
+        ("col=10 row=17 (just above upper vert. doorway)", (17, 10), 1),
+        ("row=10 col= 3 (just left  of left  horiz. dw) ", (10,  3), 1),
+        ("row=10 col= 7 (just right of left  horiz. dw) ", (10,  7), 1),
+        ("row=10 col=13 (just left  of right horiz. dw) ", (10, 13), 1),
+        ("row=10 col=17 (just right of right horiz. dw) ", (10, 17), 1),
+        ("col=10 row=10 (divider intersection)           ", (10, 10), 1),
     ]
     for label, (r, c), expected in wall_checks:
-        val    = env.grid[r][c]
+        val = env.grid[r][c]
         status = "✓" if val == expected else "✗ WRONG"
         print(f"  {status}  grid[{r:2d}][{c:2d}] = {val}  (expected {expected})  {label}")
         assert val == expected, f"grid[{r}][{c}] = {val}, expected {expected}"
     print("  All sentinel wall checks passed ✓")
 
-    # ── [4] Reset & observation ────────────────────────────────────────
-    print("\n[4] Reset")
+    # ── [4] Reset & observation ───────────────────────────────────────
+    print(f"\n[4] Reset  (obs_dim = {OBS_DIM})")
     obs, _ = env.reset(seed=42)
-    print(f"  Observation  : {obs}")
-    print(f"  Agent pos    : {env.pos}")
-    print(f"  Goal  pos    : {env.goal}")
+    print(f"  Observation shape : {obs.shape}  (expected ({OBS_DIM},))")
+    print(f"  Agent pos  : {env.pos}")
+    print(f"  Goal  pos  : {env.goal}")
     dist = np.linalg.norm(env.pos - env.goal)
     print(f"  Start↔Goal dist : {dist:.2f}  (d_min={env.d_min})")
-    assert env._is_free(env.pos),  "Start position is in a wall!"
-    assert env._is_free(env.goal), "Goal  position is in a wall!"
-    assert dist >= env.d_min,      "Start↔Goal distance violates d_min!"
-    assert obs.min() >= 0.0 and obs.max() <= 1.0, "Observation out of [0,1]!"
+    assert obs.shape == (OBS_DIM,),               f"Obs shape {obs.shape} != ({OBS_DIM},)"
+    assert env._is_free(env.pos),                 "Start position is in a wall!"
+    assert env._is_free(env.goal),                "Goal  position is in a wall!"
+    assert dist >= env.d_min,                     "Start↔Goal distance violates d_min!"
+    assert obs.min() >= 0.0 and obs.max() <= 1.0, "Observation out of [0, 1]!"
     print("  All reset assertions passed ✓")
 
-    # ── [5] Step — valid move in open space ───────────────────────────
-    print("\n[5] Step — valid move inside Room 1")
+    # ── [4b] Local patch content ──────────────────────────────────────
+    print(f"\n[4b] Local patch content  (patch_size={PS}, half={HALF})")
+
+    env.pos = np.array([5.5, 5.5], dtype=np.float32)
+    patch   = env._get_local_patch()
+    assert patch.shape == (PS ** 2,), f"Patch shape {patch.shape} unexpected"
+    assert np.all((patch == 0.0) | (patch == 1.0)), "Patch has non-binary values"
+    print(f"  Shape ({patch.shape[0]},) = ({PS}x{PS},), values binary ✓")
+
+    p2d = patch.reshape(PS, PS)
+    assert p2d[HALF][HALF] == 0.0, "Centre cell should be free"
+    print(f"  Centre  p2d[{HALF}][{HALF}]  = {p2d[HALF][HALF]:.0f}  (agent cell, free) ✓")
+
+    # Left outer wall (col=0) is HALF=5 cols left of agent col=5
+    assert p2d[HALF][0] == 1.0, "Expected left outer wall in patch"
+    print(f"  L-wall  p2d[{HALF}][  0]  = {p2d[HALF][0]:.0f}  (outer wall col=0) ✓")
+
+    # Vertical divider (col=10) is HALF=5 cols right → rightmost patch col
+    # grid[5][10] = 0 (doorway), so this should be free
+    assert p2d[HALF][PS - 1] == 0.0, "Expected doorway at right edge of patch"
+    print(f"  Doorway p2d[{HALF}][{PS-1:2d}]  = {p2d[HALF][PS-1]:.0f}  (doorway col=10, row=5) ✓")
+
+    # Out-of-bounds padding test
+    env.pos = np.array([1.5, 1.5], dtype=np.float32)   # row=1, col=1
+    p2d_oob = env._get_local_patch().reshape(PS, PS)
+    assert p2d_oob[HALF][HALF] == 0.0, "Agent cell should be free"
+    assert p2d_oob[0][0]       == 1.0, "OOB corner should be padded wall"
+    print(f"  OOB     p2d_oob[0][0]  = {p2d_oob[0][0]:.0f}  (padded wall) ✓")
+    print("  Patch content checks passed ✓")
+
+    # ── [5] Valid non-goal move: reward = 0.0 ────────────────────────
+    print("\n[5] Step — valid move inside Room 1  (reward = 0.0)")
+    env.reset(seed=42)
     env.pos = np.array([5.5, 5.5], dtype=np.float32)
     action  = np.array([0.5, 0.0], dtype=np.float32)
-    obs, reward, terminated, truncated, info = env.step(action)
-    print(f"  action={action}  valid={info['valid_move']}  "
-          f"new_pos={env.pos}  reward={reward:+.4f}")
-    assert info["valid_move"], "Expected valid move!"
+    obs, reward, _, _, info = env.step(action)
+    print(f"  action={action}  valid={info['valid_move']}  new_pos={env.pos}  reward={reward:+.4f}")
+    assert info["valid_move"],               "Expected valid move!"
     assert np.allclose(env.pos, [6.0, 5.5]), f"Unexpected position: {env.pos}"
+    assert reward == 0.0,                    f"Expected 0.0, got {reward}"
+    assert obs.shape == (OBS_DIM,),          "Post-step obs shape wrong"
     print("  ✓")
 
-    # ── [6] Step — wall collision (row=7 is wall in col=10) ───────────
-    # NOTE: row=6 (y∈[6,7)) is now a doorway — use row=7 (y=7.5) instead.
-    print("\n[6] Step — collision with vertical divider (above doorway range)")
-    env.pos = np.array([9.5, 7.5], dtype=np.float32)   # row 7 → wall in col=10
+    # ── [6] Wall collision: reward = −0.5 ────────────────────────────
+    print("\n[6] Step — wall collision  (reward = −0.5)")
+    env.pos = np.array([9.5, 7.5], dtype=np.float32)
     action  = np.array([1.0, 0.0], dtype=np.float32)
     obs, reward, _, _, info = env.step(action)
     print(f"  action={action}  valid={info['valid_move']}  "
-          f"pos unchanged={np.allclose(env.pos, [9.5, 7.5])}  reward={reward:+.4f}")
-    assert not info["valid_move"],             "Expected invalid move (wall at row 7)!"
-    assert np.allclose(env.pos, [9.5, 7.5]),  "Position should not change on invalid move!"
-    assert reward < 0,                         "Expected negative reward for wall hit!"
+          f"pos unchanged={np.allclose(env.pos,[9.5,7.5])}  reward={reward:+.4f}")
+    assert not info["valid_move"],            "Expected invalid move!"
+    assert np.allclose(env.pos, [9.5, 7.5]), "Position should not change!"
+    assert reward == -0.5,                   f"Expected -0.5, got {reward}"
     print("  ✓")
 
-    # ── [7] Step — pass through doorway centre (row=5) ────────────────
-    print("\n[7] Step — pass through vertical divider doorway centre (row=5)")
-    env.pos = np.array([9.5, 5.5], dtype=np.float32)
-    action  = np.array([1.0, 0.0], dtype=np.float32)
-    obs, reward, _, _, info = env.step(action)
-    print(f"  action={action}  valid={info['valid_move']}  "
-          f"new_pos={env.pos}  reward={reward:+.4f}")
-    assert info["valid_move"], "Expected valid move through doorway centre!"
-    assert env.pos[0] > 10.0, "Agent should have crossed to Room 3 (x > 10)!"
-    print("  ✓")
-
-    # ── [8] Step — pass through doorway lower edge (row=4) ────────────
-    print("\n[8] Step — pass through vertical divider doorway lower edge (row=4)")
-    env.pos = np.array([9.5, 4.5], dtype=np.float32)
-    action  = np.array([1.0, 0.0], dtype=np.float32)
-    obs, reward, _, _, info = env.step(action)
-    print(f"  action={action}  valid={info['valid_move']}  "
-          f"new_pos={env.pos}  reward={reward:+.4f}")
-    assert info["valid_move"], "Expected valid move through doorway lower edge!"
-    assert env.pos[0] > 10.0, "Agent should have crossed to Room 3 (x > 10)!"
-    print("  ✓")
-
-    # ── [9] Step — pass through doorway upper edge (row=6) ────────────
-    print("\n[9] Step — pass through vertical divider doorway upper edge (row=6)")
-    env.pos = np.array([9.5, 6.5], dtype=np.float32)
-    action  = np.array([1.0, 0.0], dtype=np.float32)
-    obs, reward, _, _, info = env.step(action)
-    print(f"  action={action}  valid={info['valid_move']}  "
-          f"new_pos={env.pos}  reward={reward:+.4f}")
-    assert info["valid_move"], "Expected valid move through doorway upper edge!"
-    assert env.pos[0] > 10.0, "Agent should have crossed to Room 3 (x > 10)!"
-    print("  ✓")
-
-    # ── [10] Step — pass through horizontal doorway (col=5, row=10) ───
-    print("\n[10] Step — pass through horizontal divider doorway (col=5)")
-    env.pos = np.array([5.5, 9.5], dtype=np.float32)   # just below horizontal divider
-    action  = np.array([0.0, 1.0], dtype=np.float32)   # move up through doorway
-    obs, reward, _, _, info = env.step(action)
-    print(f"  action={action}  valid={info['valid_move']}  "
-          f"new_pos={env.pos}  reward={reward:+.4f}")
-    assert info["valid_move"], "Expected valid move through horizontal doorway!"
-    assert env.pos[1] > 10.0, "Agent should have crossed to Room 2 (y > 10)!"
-    print("  ✓")
+    # ── [7–10] Doorway crossings: all valid, reward = 0.0 ────────────
+    doorway_steps = [
+        ("[7] Vertical doorway centre   (row=5)",
+         [9.5, 5.5], [1.0, 0.0], lambda p: p[0] > 10.0),
+        ("[8] Vertical doorway lower    (row=4)",
+         [9.5, 4.5], [1.0, 0.0], lambda p: p[0] > 10.0),
+        ("[9] Vertical doorway upper    (row=6)",
+         [9.5, 6.5], [1.0, 0.0], lambda p: p[0] > 10.0),
+        ("[10] Horizontal doorway       (col=5)",
+         [5.5, 9.5], [0.0, 1.0], lambda p: p[1] > 10.0),
+    ]
+    for label, start, act_v, cross_check in doorway_steps:
+        print(f"\n{label}")
+        env.pos = np.array(start, dtype=np.float32)
+        action  = np.array(act_v, dtype=np.float32)
+        obs, reward, _, _, info = env.step(action)
+        print(f"  valid={info['valid_move']}  new_pos={env.pos}  reward={reward:+.4f}")
+        assert info["valid_move"],    f"{label}: expected valid move"
+        assert cross_check(env.pos), f"{label}: agent did not cross divider"
+        assert reward == 0.0,        f"{label}: expected 0.0, got {reward}"
+        print("  ✓")
 
     # ── [11] Action clipping ──────────────────────────────────────────
     print("\n[11] Action clipping")
     env.reset(seed=0)
-    raw_action = np.array([5.0, -3.0], dtype=np.float32)
-    obs, reward, _, _, info = env.step(raw_action)
-    print(f"  raw action {raw_action} clipped to [-1,+1]^2 — step executed ✓")
+    obs, _, _, _, _ = env.step(np.array([5.0, -3.0], dtype=np.float32))
+    assert obs.shape == (OBS_DIM,), f"Post-step obs shape wrong: {obs.shape}"
+    print(f"  raw [5., -3.] clipped to [-1,+1]^2, obs.shape={obs.shape} ✓")
 
     print("\n" + "=" * 65)
     print("  All sanity checks passed ✓")
