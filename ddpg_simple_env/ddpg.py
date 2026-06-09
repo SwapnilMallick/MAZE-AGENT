@@ -471,7 +471,7 @@ def train(
     polyak           = 0.995,
     act_noise        = 0.1,
     # ── Reward shaping ────────────────────────────────────
-    alpha            = 0.1,   # weight for distance-based shaping term r2
+    alpha            = 0.05,   # weight for distance-based shaping term r2
     # ── Evaluation & logging ──────────────────────────────
     n_eval_episodes  = 10,
     save_freq        = 10,      # checkpoint every N epochs
@@ -840,12 +840,12 @@ if __name__ == '__main__':
 
     # ── Full runs (run locally, preferably with GPU) ──────────────────────────
     # EmptyGridEnv full run:
-    train(env_class=EmptyGridEnv,     epochs=100, steps_per_epoch=4_000,
-           start_steps=5_000, update_after=1_000, seed=42,
-           checkpoint_dir='checkpoints_empty_full',
-           results_dir='results_empty_full')
+    #train(env_class=EmptyGridEnv,     epochs=100, steps_per_epoch=4_000,
+    #       start_steps=5_000, update_after=1_000, seed=42,
+    #       checkpoint_dir='checkpoints_empty_full',
+    #       results_dir='results_empty_full')
     #
     # FourRoomMazeEnv full run:
-    # train(env_class=FourRoomMazeEnv,  epochs=100, steps_per_epoch=4_000,
-    #       start_steps=5_000, update_after=1_000, seed=42,
-    #       checkpoint_dir='checkpoints_maze_full')
+    train(env_class=FourRoomMazeEnv,  epochs=100, steps_per_epoch=4_000,
+           start_steps=5_000, update_after=1_000, seed=42,
+           checkpoint_dir='checkpoints_maze_full')
